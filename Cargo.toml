@@ -1,0 +1,13 @@
+[package]
+name = "asa-profile-parser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+quick-xml = "0.29"
+rayon = "1.7"
+csv = "1.1"
+anyhow = "1.0"
+indicatif = "0.17"
+crossbeam-channel = "0.5"
+serde = { version = "1.0.228", features = ["derive"] }
