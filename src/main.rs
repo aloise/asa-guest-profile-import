@@ -1,21 +1,15 @@
-// Cargo.toml (add)
-/// quick-xml = "0.29"
-/// rayon = "1.7"
-/// csv = "1.1"
-/// anyhow = "1.0"
-/// indicatif = "0.17"
-/// crossbeam-channel = "0.5"
-
-use std::fs::File;
-use std::io::BufReader;
-use std::path::PathBuf;
 use anyhow::{Context, Result};
+use crossbeam_channel::unbounded;
+use csv::Writer;
+use indicatif::{ProgressBar, ProgressStyle};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use rayon::prelude::*;
-use csv::Writer;
-use indicatif::{ProgressBar, ProgressStyle};
-use crossbeam_channel::unbounded;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::PathBuf;
+use std::sync::Arc;
+use dashmap::DashSet;
 
 #[derive(Debug, serde::Serialize)]
 struct Guest {
@@ -34,12 +28,13 @@ struct Guest {
     last_update: Option<String>,
     primary_email: Option<String>,
     primary_phone: Option<String>,
+    newsletter_agreement: bool,
 }
 
 fn parse_guests_from_file(path: &PathBuf) -> Result<Vec<Guest>> {
     let f = File::open(path).with_context(|| format!("open {:?}", path))?;
     let mut reader = Reader::from_reader(BufReader::new(f));
-    reader.trim_text(true);
+    // reader.trim_text(true);
     let mut buf = Vec::new();
 
     let mut guests = Vec::new();
@@ -75,6 +70,7 @@ fn parse_guests_from_file(path: &PathBuf) -> Result<Vec<Guest>> {
                             last_update: None,
                             primary_email: None,
                             primary_phone: None,
+                            newsletter_agreement: false,
                         });
                         emails.clear();
                         phones.clear();
@@ -91,7 +87,7 @@ fn parse_guests_from_file(path: &PathBuf) -> Result<Vec<Guest>> {
                 }
             }
             Ok(Event::Text(e)) => {
-                let txt = e.unescape().unwrap_or_default().into_owned();
+                let txt = e.decode().unwrap_or_default().into_owned();
                 if let Some(tag) = current_tag.take() {
                     if let Some(g) = current_guest.as_mut() {
                         match tag.as_str() {
@@ -115,6 +111,10 @@ fn parse_guests_from_file(path: &PathBuf) -> Result<Vec<Guest>> {
                             "NummerAdresse" => {
                                 comm_value = Some(txt);
                             }
+                            "Newsletter" => {
+                                // ignore for now
+                                g.newsletter_agreement = txt == "true";
+                            }
                             _ => { /* ignore other tags */ }
                         }
                     } else {
@@ -128,7 +128,8 @@ fn parse_guests_from_file(path: &PathBuf) -> Result<Vec<Guest>> {
                 // If both comm_type and comm_value are set, push to lists and clear
                 if let (Some(t), Some(v)) = (comm_type.take(), comm_value.take()) {
                     let t_lower = t.to_lowercase();
-                    if t_lower.starts_with('e') { // E1, E2 -> email
+                    if t_lower.starts_with('e') {
+                        // E1, E2 -> email
                         emails.push(v.clone());
                     } else {
                         // treat others as phone/fax/mobile
@@ -172,16 +173,17 @@ fn main() -> Result<()> {
 
     let pb = ProgressBar::new(paths.len() as u64);
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
-            .unwrap()
-            .progress_chars("#>-"),
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}",
+        )?
+        .progress_chars("#>-"),
     );
 
     let (tx, rx) = unbounded::<Guest>();
 
     // CSV writer thread
     let writer_handle = std::thread::spawn(move || -> Result<()> {
-        let mut wtr = Writer::from_path("guests.csv")?;
+        let mut wtr = Writer::from_path("./guests-with-agreement.csv")?;
         for guest in rx.iter() {
             wtr.serialize(guest)?;
         }
@@ -189,12 +191,24 @@ fn main() -> Result<()> {
         Ok(())
     });
 
+    let seen_emails = Arc::new(DashSet::new());
+
     // adjust number of threads if IO bound
     paths.par_iter().for_each_with(tx.clone(), |sender, path| {
         match parse_guests_from_file(path) {
             Ok(list) => {
                 for g in list {
-                    let _ = sender.send(g);
+                    if g.newsletter_agreement {
+                        if let Some(email) = &g.primary_email {
+                            // Insert returns true if the email was not present
+                            if seen_emails.insert(email.clone()) {
+                                let _ = sender.send(g);
+                            } else {
+                                // duplicate email, skip
+                                println!("Duplicated email: {}", email);
+                            }
+                        }
+                    }
                 }
             }
             Err(err) => {

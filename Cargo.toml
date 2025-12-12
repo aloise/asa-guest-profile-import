@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-quick-xml = "0.29"
-rayon = "1.7"
-csv = "1.1"
-anyhow = "1.0"
-indicatif = "0.17"
-crossbeam-channel = "0.5"
+quick-xml = "0.38.4"
+rayon = "1.11.0"
+csv = "1.4.0"
+anyhow = "1.0.100"
+indicatif = "0.18.3"
+crossbeam-channel = "0.5.15"
 serde = { version = "1.0.228", features = ["derive"] }
+dashmap = "5.5.3"
