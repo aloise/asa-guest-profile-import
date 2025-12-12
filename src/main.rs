@@ -1,17 +1,19 @@
 use anyhow::{Context, Result};
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{unbounded, Sender};
 use csv::Writer;
 use dashmap::DashSet;
 use indicatif::{ProgressBar, ProgressStyle};
-use quick_xml::Reader;
 use quick_xml::events::Event;
+use quick_xml::Reader;
 use rayon::prelude::*;
+use std::env;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize)]
 struct Guest {
     id: Option<String>,
     name1: Option<String>,
@@ -31,126 +33,175 @@ struct Guest {
     newsletter_agreement: bool,
 }
 
-fn parse_guests_from_file(path: &PathBuf) -> Result<Vec<Guest>> {
-    let f = File::open(path).with_context(|| format!("open {:?}", path))?;
+#[derive(Debug, Clone, Copy)]
+enum Tag {
+    Gast,
+    Kommunikation,
+    // Guest fields
+    Id,
+    Name1,
+    Name2,
+    Geburtsdatum,
+    Geschlecht,
+    Strasse1,
+    Ort,
+    Plz,
+    Land,
+    Staatsbuergerschaft,
+    Vip,
+    CreationTime,
+    LastUpdateTime,
+    Newsletter,
+    // Kommunikation fields
+    Typ,
+    NummerAdresse,
+    // Anything else
+    Unknown,
+}
+
+fn tag_from_bytes(name: &[u8]) -> Tag {
+    match name {
+        b"Gast" => Tag::Gast,
+        b"Kommunikation" => Tag::Kommunikation,
+        b"ID" => Tag::Id,
+        b"Name1" => Tag::Name1,
+        b"Name2" => Tag::Name2,
+        b"Geburtsdatum" => Tag::Geburtsdatum,
+        b"Geschlecht" => Tag::Geschlecht,
+        b"Strasse1" => Tag::Strasse1,
+        b"Ort" => Tag::Ort,
+        b"PLZ" => Tag::Plz,
+        b"Land" => Tag::Land,
+        b"Staatsbuergerschaft" => Tag::Staatsbuergerschaft,
+        b"VIP" => Tag::Vip,
+        b"CreationTime" => Tag::CreationTime,
+        b"LastUpdateTime" => Tag::LastUpdateTime,
+        b"Newsletter" => Tag::Newsletter,
+        b"Typ" => Tag::Typ,
+        b"NummerAdresse" => Tag::NummerAdresse,
+        _ => Tag::Unknown,
+    }
+}
+
+#[derive(Debug, Default)]
+struct ParseState {
+    current_guest: Option<Guest>,
+    current_tag: Option<Tag>,
+    // temp storage for communication entries inside a guest
+    comm_type: Option<String>,
+    comm_value: Option<String>,
+    // collect found emails/phones
+    emails: Vec<String>,
+    phones: Vec<String>,
+}
+
+impl ParseState {
+    fn on_start(&mut self, tag: Tag) {
+        match tag {
+            Tag::Gast => {
+                self.current_guest = Some(Guest::default());
+                self.emails.clear();
+                self.phones.clear();
+                self.current_tag = None;
+            }
+            Tag::Kommunikation => {
+                self.comm_type = None;
+                self.comm_value = None;
+                self.current_tag = None;
+            }
+            other => {
+                self.current_tag = Some(other);
+            }
+        }
+    }
+
+    fn on_text(&mut self, tag: Tag, txt: String) {
+        let Some(g) = self.current_guest.as_mut() else {
+            return;
+        };
+
+        match tag {
+            Tag::Id => g.id = Some(txt),
+            Tag::Name1 => g.name1 = Some(txt),
+            Tag::Name2 => g.name2 = Some(txt),
+            Tag::Geburtsdatum => g.geburtsdatum = Some(txt),
+            Tag::Geschlecht => g.geschlecht = Some(txt),
+            Tag::Strasse1 => g.strasse1 = Some(txt),
+            Tag::Ort => g.ort = Some(txt),
+            Tag::Plz => g.plz = Some(txt),
+            Tag::Land => g.land = Some(txt),
+            Tag::Staatsbuergerschaft => g.staatsbuergerschaft = Some(txt),
+            Tag::Vip => g.vip = Some(txt),
+            Tag::CreationTime => g.creation_time = Some(txt),
+            Tag::LastUpdateTime => g.last_update = Some(txt),
+            Tag::Typ => {
+                self.comm_type = Some(txt);
+            }
+            Tag::NummerAdresse => {
+                self.comm_value = Some(txt);
+            }
+            Tag::Newsletter => {
+                g.newsletter_agreement = txt == "true";
+            }
+            _ => { /* ignore other tags */ }
+        }
+    }
+
+    fn on_end(&mut self, tag: Tag) -> Option<Guest> {
+        match tag {
+            Tag::Kommunikation => {
+                if let (Some(t), Some(v)) = (self.comm_type.take(), self.comm_value.take()) {
+                    let t_lower = t.to_lowercase();
+                    if t_lower.starts_with('e') {
+                        self.emails.push(v);
+                    } else {
+                        self.phones.push(v);
+                    }
+                }
+                None
+            }
+            Tag::Gast => {
+                let mut g = self.current_guest.take()?;
+                g.primary_email = self.emails.get(0).cloned();
+                g.primary_phone = self.phones.get(0).cloned();
+                Some(g)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn parse_guests_from_file<P: AsRef<Path>>(path: P) -> Result<Vec<Guest>> {
+    let path_ref = path.as_ref();
+    let f = File::open(path_ref).with_context(|| format!("open {:?}", path_ref))?;
     let mut reader = Reader::from_reader(BufReader::new(f));
-    // reader.trim_text(true);
     let mut buf = Vec::new();
 
     let mut guests = Vec::new();
-    let mut current_guest: Option<Guest> = None;
-    let mut current_tag: Option<String> = None;
-
-    // temp storage for communication entries inside a guest
-    let mut comm_type: Option<String> = None;
-    let mut comm_value: Option<String> = None;
-    // collect found emails/phones
-    let mut emails: Vec<String> = Vec::new();
-    let mut phones: Vec<String> = Vec::new();
+    let mut state = ParseState::default();
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                match name.as_str() {
-                    "Gast" => {
-                        current_guest = Some(Guest {
-                            id: None,
-                            name1: None,
-                            name2: None,
-                            geburtsdatum: None,
-                            geschlecht: None,
-                            strasse1: None,
-                            ort: None,
-                            plz: None,
-                            land: None,
-                            staatsbuergerschaft: None,
-                            vip: None,
-                            creation_time: None,
-                            last_update: None,
-                            primary_email: None,
-                            primary_phone: None,
-                            newsletter_agreement: false,
-                        });
-                        emails.clear();
-                        phones.clear();
-                    }
-                    "Kommunikation" => {
-                        // start of a communication entry
-                        comm_type = None;
-                        comm_value = None;
-                    }
-                    other => {
-                        // regular tag inside Gast or Kommunikation
-                        current_tag = Some(other.to_string());
-                    }
-                }
+                let tag = tag_from_bytes(e.name().as_ref());
+                state.on_start(tag);
             }
             Ok(Event::Text(e)) => {
                 let txt = e.decode().unwrap_or_default().into_owned();
-                if let Some(tag) = current_tag.take() {
-                    if let Some(g) = current_guest.as_mut() {
-                        match tag.as_str() {
-                            "ID" => g.id = Some(txt),
-                            "Name1" => g.name1 = Some(txt),
-                            "Name2" => g.name2 = Some(txt),
-                            "Geburtsdatum" => g.geburtsdatum = Some(txt),
-                            "Geschlecht" => g.geschlecht = Some(txt),
-                            "Strasse1" => g.strasse1 = Some(txt),
-                            "Ort" => g.ort = Some(txt),
-                            "PLZ" => g.plz = Some(txt),
-                            "Land" => g.land = Some(txt),
-                            "Staatsbuergerschaft" => g.staatsbuergerschaft = Some(txt),
-                            "VIP" => g.vip = Some(txt),
-                            "CreationTime" => g.creation_time = Some(txt),
-                            "LastUpdateTime" => g.last_update = Some(txt),
-                            // communication sub-tags captured below
-                            "Typ" => {
-                                comm_type = Some(txt);
-                            }
-                            "NummerAdresse" => {
-                                comm_value = Some(txt);
-                            }
-                            "Newsletter" => {
-                                // ignore for now
-                                g.newsletter_agreement = txt == "true";
-                            }
-                            _ => { /* ignore other tags */ }
-                        }
-                    } else {
-                        // if not inside a guest, ignore
-                    }
-                } else {
-                    // sometimes Kommmunikation child nodes appear without current_tag
-                    // handle Typ / NummerAdresse by checking last tag from reader isn't available here
+                if let Some(tag) = state.current_tag.take() {
+                    state.on_text(tag, txt);
                 }
             }
-
-            // Inside the loop, replace the Event::End arm with this:
             Ok(Event::End(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if name == "Kommunikation" {
-                    if let (Some(t), Some(v)) = (comm_type.take(), comm_value.take()) {
-                        let t_lower = t.to_lowercase();
-                        if t_lower.starts_with('e') {
-                            emails.push(v.clone());
-                        } else {
-                            phones.push(v.clone());
-                        }
-                    }
+                let tag = tag_from_bytes(e.name().as_ref());
+                if let Some(g) = state.on_end(tag) {
+                    guests.push(g);
                 }
-                if name == "Gast" {
-                    if let Some(mut g) = current_guest.take() {
-                        g.primary_email = emails.get(0).cloned();
-                        g.primary_phone = phones.get(0).cloned();
-                        guests.push(g);
-                    }
-                }
-                current_tag = None;
+                state.current_tag = None;
             }
             Ok(Event::Eof) => break,
             Err(err) => {
-                return Err(anyhow::anyhow!("Error parsing {:?}: {}", path, err));
+                return Err(anyhow::anyhow!("Error parsing {:?}: {}", path_ref, err));
             }
             _ => {}
         }
@@ -160,66 +211,96 @@ fn parse_guests_from_file(path: &PathBuf) -> Result<Vec<Guest>> {
     Ok(guests)
 }
 
-fn main() -> Result<()> {
-    let dir = "/Users/imordashev/workspace/smart-host/docs/adler-resort-sicilia/adler-resort-sicilia/pull_profiles"; // change
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+fn collect_xml_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("list dir {:?}", dir))?
         .filter_map(|e| e.ok().map(|d| d.path()))
         .filter(|p| p.extension().map(|s| s == "xml").unwrap_or(false))
         .collect();
-
     paths.sort();
+    Ok(paths)
+}
 
-    let pb = ProgressBar::new(paths.len() as u64);
-    pb.set_style(
+fn configure_progress_bar(total: usize) -> ProgressBar {
+    let pb = ProgressBar::new(total as u64);
+    let _ = pb.set_style(
         ProgressStyle::with_template(
             "{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}",
-        )?
+        )
+        .unwrap()
         .progress_chars("#>-"),
     );
+    pb
+}
 
+fn spawn_csv_writer(output: &Path) -> (Sender<Guest>, JoinHandle<Result<()>>) {
     let (tx, rx) = unbounded::<Guest>();
-
-    // CSV writer thread
-    let writer_handle = std::thread::spawn(move || -> Result<()> {
-        let mut wtr = Writer::from_path("./guests-with-agreement.csv")?;
+    let path = output.to_path_buf();
+    let handle = std::thread::spawn(move || -> Result<()> {
+        let mut wtr = Writer::from_path(path)?;
         for guest in rx.iter() {
             wtr.serialize(guest)?;
         }
         wtr.flush()?;
         Ok(())
     });
+    (tx, handle)
+}
 
-    let seen_emails = Arc::new(DashSet::new());
+fn eligible_clean_email(g: &Guest) -> Option<String> {
+    if !g.newsletter_agreement {
+        return None;
+    }
+    let email = g.primary_email.as_deref()?;
+    Some(email.trim().to_lowercase())
+}
 
-    // adjust number of threads if IO bound
+fn handle_file(path: &Path, sender: &Sender<Guest>, seen_emails: &Arc<DashSet<String>>) -> Result<()> {
+    let list = parse_guests_from_file(path)?;
+
+    for g in list {
+        let Some(clean_email) = eligible_clean_email(&g) else {
+            continue;
+        };
+        if seen_emails.insert(clean_email) {
+            let _ = sender.send(g);
+        }
+    }
+
+    Ok(())
+}
+
+fn process_paths(paths: &[PathBuf], tx: &Sender<Guest>, seen_emails: &Arc<DashSet<String>>, pb: &ProgressBar) {
     paths.par_iter().for_each_with(tx.clone(), |sender, path| {
-        match parse_guests_from_file(path) {
-            Ok(list) => {
-                for g in list {
-                    if g.newsletter_agreement {
-                        if let Some(email) = &g.primary_email {
-                            // Insert returns true if the email was not present
-                            let clean_email = email.trim().to_lowercase();
-                            if seen_emails.insert(clean_email) {
-                                let _ = sender.send(g);
-                            }
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("Failed to parse {:?}: {}", path, err);
-            }
+        if let Err(err) = handle_file(path.as_path(), sender, seen_emails) {
+            eprintln!("Failed to parse {:?}: {}", path, err);
         }
         pb.inc(1);
     });
+}
+
+fn main() -> Result<()> {
+    // Default path kept for convenience; can be overridden via CLI.
+    let default_input_dir = "../docs/adler-resort-sicilia/adler-resort-sicilia/pull_profiles";
+    let mut args = env::args().skip(1);
+    let input_dir = args.next().unwrap_or_else(|| default_input_dir.to_string());
+    let output_csv = args
+        .next()
+        .unwrap_or_else(|| "./guests-with-agreement.csv".to_string());
+
+    let paths = collect_xml_files(Path::new(&input_dir))?;
+    let pb = configure_progress_bar(paths.len());
+
+    let (tx, writer_handle) = spawn_csv_writer(Path::new(&output_csv));
+    let seen_emails = Arc::new(DashSet::new());
+
+    process_paths(&paths, &tx, &seen_emails, &pb);
 
     drop(tx);
     pb.finish_with_message("done");
     writer_handle.join().expect("writer thread")?;
 
     println!("Unique emails count: {}", seen_emails.len());
-
     Ok(())
 }
 
@@ -272,5 +353,63 @@ mod tests {
         assert_eq!(g.primary_email.as_deref(), Some("john.doe@example.com"));
         assert_eq!(g.primary_phone.as_deref(), Some("+49123456789"));
         assert!(g.newsletter_agreement);
+    }
+
+    #[test]
+    fn test_parse_comm_entry_missing_fields_is_ignored() {
+        let xml = r#"
+            <Gaste>
+                <Gast>
+                    <ID>1</ID>
+                    <Kommunikation>
+                        <Typ>E1</Typ>
+                    </Kommunikation>
+                    <Kommunikation>
+                        <NummerAdresse>john.doe@example.com</NummerAdresse>
+                    </Kommunikation>
+                    <Newsletter>true</Newsletter>
+                </Gast>
+            </Gaste>
+        "#;
+
+        let mut tmpfile = NamedTempFile::new().unwrap();
+        write!(tmpfile, "{}", xml).unwrap();
+
+        let guests = parse_guests_from_file(tmpfile.path()).unwrap();
+        assert_eq!(guests.len(), 1);
+        let g = &guests[0];
+
+        // Because no single Kommunikation contains both Typ and NummerAdresse.
+        assert_eq!(g.primary_email.as_deref(), None);
+        assert_eq!(g.primary_phone.as_deref(), None);
+        assert!(g.newsletter_agreement);
+    }
+
+    #[test]
+    fn test_parse_multiple_emails_uses_first() {
+        let xml = r#"
+            <Gaste>
+                <Gast>
+                    <ID>1</ID>
+                    <Kommunikation>
+                        <Typ>E1</Typ>
+                        <NummerAdresse>first@example.com</NummerAdresse>
+                    </Kommunikation>
+                    <Kommunikation>
+                        <Typ>E2</Typ>
+                        <NummerAdresse>second@example.com</NummerAdresse>
+                    </Kommunikation>
+                    <Newsletter>true</Newsletter>
+                </Gast>
+            </Gaste>
+        "#;
+
+        let mut tmpfile = NamedTempFile::new().unwrap();
+        write!(tmpfile, "{}", xml).unwrap();
+
+        let guests = parse_guests_from_file(tmpfile.path()).unwrap();
+        assert_eq!(guests.len(), 1);
+        let g = &guests[0];
+        assert_eq!(g.primary_email.as_deref(), Some("first@example.com"));
     }
 }
