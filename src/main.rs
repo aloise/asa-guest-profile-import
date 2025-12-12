@@ -3,10 +3,10 @@ use crossbeam_channel::{unbounded, Sender};
 use csv::Writer;
 use dashmap::DashSet;
 use indicatif::{ProgressBar, ProgressStyle};
+use clap::Parser;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use rayon::prelude::*;
-use std::env;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -279,19 +279,30 @@ fn process_paths(paths: &[PathBuf], tx: &Sender<Guest>, seen_emails: &Arc<DashSe
     });
 }
 
-fn main() -> Result<()> {
-    // Default path kept for convenience; can be overridden via CLI.
-    let default_input_dir = "../docs/adler-resort-sicilia/adler-resort-sicilia/pull_profiles";
-    let mut args = env::args().skip(1);
-    let input_dir = args.next().unwrap_or_else(|| default_input_dir.to_string());
-    let output_csv = args
-        .next()
-        .unwrap_or_else(|| "./guests-with-agreement.csv".to_string());
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about = "Extract guests from ASA XML profiles and export newsletter opt-ins to CSV",
+    long_about = None
+)]
+struct Cli {
+    /// Directory containing input XML files
+    #[arg(short = 'i', long = "input", value_name = "DIR", default_value = "../docs/adler-resort-sicilia/adler-resort-sicilia/pull_profiles")]
+    input_dir: PathBuf,
 
-    let paths = collect_xml_files(Path::new(&input_dir))?;
+    /// Output CSV file path
+    #[arg(short = 'o', long = "output", value_name = "FILE", default_value = "./guests-with-agreement.csv")]
+    output_csv: PathBuf,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let paths = collect_xml_files(cli.input_dir.as_path())?;
     let pb = configure_progress_bar(paths.len());
 
-    let (tx, writer_handle) = spawn_csv_writer(Path::new(&output_csv));
+    let (tx, writer_handle) = spawn_csv_writer(cli.output_csv.as_path());
     let seen_emails = Arc::new(DashSet::new());
 
     process_paths(&paths, &tx, &seen_emails, &pb);
@@ -307,6 +318,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -411,5 +423,30 @@ mod tests {
         assert_eq!(guests.len(), 1);
         let g = &guests[0];
         assert_eq!(g.primary_email.as_deref(), Some("first@example.com"));
+    }
+
+    #[test]
+    fn test_cli_defaults() {
+        let cli = Cli::try_parse_from(["asa-profile-parser"]).unwrap();
+        assert_eq!(
+            cli.input_dir,
+            PathBuf::from("../docs/adler-resort-sicilia/adler-resort-sicilia/pull_profiles")
+        );
+        assert_eq!(cli.output_csv, PathBuf::from("./guests-with-agreement.csv"));
+    }
+
+    #[test]
+    fn test_cli_overrides() {
+        let cli = Cli::try_parse_from([
+            "asa-profile-parser",
+            "--input",
+            "some/input/dir",
+            "--output",
+            "some/output.csv",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.input_dir, PathBuf::from("some/input/dir"));
+        assert_eq!(cli.output_csv, PathBuf::from("some/output.csv"));
     }
 }
