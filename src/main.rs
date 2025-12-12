@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use crossbeam_channel::unbounded;
 use csv::Writer;
+use dashmap::DashSet;
 use indicatif::{ProgressBar, ProgressStyle};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -9,7 +10,6 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
-use dashmap::DashSet;
 
 #[derive(Debug, serde::Serialize)]
 struct Guest {
@@ -124,30 +124,28 @@ fn parse_guests_from_file(path: &PathBuf) -> Result<Vec<Guest>> {
                     // sometimes Kommmunikation child nodes appear without current_tag
                     // handle Typ / NummerAdresse by checking last tag from reader isn't available here
                 }
-
-                // If both comm_type and comm_value are set, push to lists and clear
-                if let (Some(t), Some(v)) = (comm_type.take(), comm_value.take()) {
-                    let t_lower = t.to_lowercase();
-                    if t_lower.starts_with('e') {
-                        // E1, E2 -> email
-                        emails.push(v.clone());
-                    } else {
-                        // treat others as phone/fax/mobile
-                        phones.push(v.clone());
-                    }
-                }
             }
+
+            // Inside the loop, replace the Event::End arm with this:
             Ok(Event::End(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if name == "Kommunikation" {
+                    if let (Some(t), Some(v)) = (comm_type.take(), comm_value.take()) {
+                        let t_lower = t.to_lowercase();
+                        if t_lower.starts_with('e') {
+                            emails.push(v.clone());
+                        } else {
+                            phones.push(v.clone());
+                        }
+                    }
+                }
                 if name == "Gast" {
                     if let Some(mut g) = current_guest.take() {
-                        // choose primary email and phone by preference
                         g.primary_email = emails.get(0).cloned();
                         g.primary_phone = phones.get(0).cloned();
                         guests.push(g);
                     }
                 }
-                // reset tag on any end
                 current_tag = None;
             }
             Ok(Event::Eof) => break,
@@ -201,11 +199,9 @@ fn main() -> Result<()> {
                     if g.newsletter_agreement {
                         if let Some(email) = &g.primary_email {
                             // Insert returns true if the email was not present
-                            if seen_emails.insert(email.clone()) {
+                            let clean_email = email.trim().to_lowercase();
+                            if seen_emails.insert(clean_email) {
                                 let _ = sender.send(g);
-                            } else {
-                                // duplicate email, skip
-                                println!("Duplicated email: {}", email);
                             }
                         }
                     }
@@ -221,5 +217,60 @@ fn main() -> Result<()> {
     drop(tx);
     pb.finish_with_message("done");
     writer_handle.join().expect("writer thread")?;
+
+    println!("Unique emails count: {}", seen_emails.len());
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_parse_single_guest() {
+        let xml = r#"
+            <Gaste>
+                <Gast>
+                    <ID>1</ID>
+                    <Name1>John</Name1>
+                    <Name2>Doe</Name2>
+                    <Geburtsdatum>1990-01-01</Geburtsdatum>
+                    <Geschlecht>M</Geschlecht>
+                    <Strasse1>Main Street 1</Strasse1>
+                    <Ort>Sampletown</Ort>
+                    <PLZ>12345</PLZ>
+                    <Land>DE</Land>
+                    <Staatsbuergerschaft>DE</Staatsbuergerschaft>
+                    <VIP>no</VIP>
+                    <CreationTime>2024-01-01T12:00:00</CreationTime>
+                    <LastUpdateTime>2024-06-01T12:00:00</LastUpdateTime>
+                    <Kommunikation>
+                        <Typ>E1</Typ>
+                        <NummerAdresse>john.doe@example.com</NummerAdresse>
+                    </Kommunikation>
+                    <Kommunikation>
+                        <Typ>T1</Typ>
+                        <NummerAdresse>+49123456789</NummerAdresse>
+                    </Kommunikation>
+                    <Newsletter>true</Newsletter>
+                </Gast>
+            </Gaste>
+        "#;
+
+        let mut tmpfile = NamedTempFile::new().unwrap();
+        write!(tmpfile, "{}", xml).unwrap();
+        let path = tmpfile.path().to_path_buf();
+
+        let guests = parse_guests_from_file(&path).unwrap();
+        assert_eq!(guests.len(), 1);
+        let g = &guests[0];
+        assert_eq!(g.id.as_deref(), Some("1"));
+        assert_eq!(g.name1.as_deref(), Some("John"));
+        assert_eq!(g.primary_email.as_deref(), Some("john.doe@example.com"));
+        assert_eq!(g.primary_phone.as_deref(), Some("+49123456789"));
+        assert!(g.newsletter_agreement);
+    }
 }
